@@ -147,8 +147,6 @@ def send_telegram(message):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
-    if not resp.ok:
-        print(resp.text)
     resp.raise_for_status()
 
 
@@ -170,16 +168,17 @@ def build_report(label, tides, forecast, reference_time):
     for t in next_tides:
         lines.append(f"{t['type']} tide: {t['time'].strftime('%H:%M')} ({t['height']:.1f}m)")
 
-    # Weather snapshot at the nearest upcoming tide
-    mid_point = next_tides[0]["time"]
-    hour = nearest_hour_forecast(forecast, mid_point)
-    if hour:
-        lines.append("")
-        lines.append(f"Conditions around {mid_point.strftime('%H:%M')}:")
-        lines.append(
-            f"🌡️ {hour['temp_c']:.0f}°C · 💨 Wind {hour['wind_kmh']:.0f} km/h · "
-            f"🌊 Waves {hour.get('wave_m', 0):.1f}m · {weather_text(hour['weather_code'])}"
-        )
+    # Weather snapshot at each High tide in this report (not just the nearest tide)
+    high_tides = [t for t in next_tides if t["type"] == "High"]
+    for high in high_tides:
+        hour = nearest_hour_forecast(forecast, high["time"])
+        if hour:
+            lines.append("")
+            lines.append(f"Conditions at high tide ({high['time'].strftime('%H:%M')}):")
+            lines.append(
+                f"🌡️ {hour['temp_c']:.0f}°C · 💨 Wind {hour['wind_kmh']:.0f} km/h · "
+                f"🌊 Waves {hour.get('wave_m', 0):.1f}m · {weather_text(hour['weather_code'])}"
+            )
 
     # Soft suggestions for high tides in this report
     notes = []
