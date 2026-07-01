@@ -147,6 +147,8 @@ def send_telegram(message):
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message})
+    if not resp.ok:
+        print(resp.text)
     resp.raise_for_status()
 
 
