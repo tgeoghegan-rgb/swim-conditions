@@ -2,9 +2,11 @@ name: Swim Conditions Check
 
 on:
   schedule:
-    # 07:00 Europe/Paris (summer, UTC+2) = 05:00 UTC
-    # Adjust if you want a different check time or a second run in the afternoon
-    - cron: '0 5 * * *'
+    # 07:30 and 15:30 Europe/Paris (summer, UTC+2) = 05:30 and 13:30 UTC
+    # After daylight saving ends in autumn, shift both by 1 hour later in UTC
+    # to keep hitting 07:30/15:30 local (i.e. 06:30 and 14:30 UTC)
+    - cron: '30 5 * * *'
+    - cron: '30 13 * * *'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab to test
 
 jobs:

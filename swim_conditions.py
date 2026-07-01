@@ -1,22 +1,17 @@
 """
 Swim conditions notifier — Saint-Malo / Lancieux coast, Brittany
 
-Checks tide + weather + marine conditions for good swim windows around
-high tide, and sends a Telegram message if conditions look good.
-
-Run this on a schedule (cron, GitHub Actions, etc.) once or twice a day —
-e.g. 7am to check the day's windows.
+Sends a Telegram report twice a day (morning + afternoon) with:
+  - High and low tide times/heights
+  - Temperature, wind, wave height, and weather description
+  - A soft "good swim window" suggestion near high tide (informational only —
+    the report always sends regardless of conditions)
 
 SETUP REQUIRED:
-1. Telegram bot:
-   - Message @BotFather on Telegram, run /newbot, copy the token
-   - Message your new bot once (anything), then visit:
-     https://api.telegram.org/bot<TOKEN>/getUpdates
-     to find your chat_id in the response
-2. SHOM tide API:
-   - Register at https://services.data.shom.fr for API access (free)
-   - Or swap in worldtides.info if you prefer (see fetch_tides below)
-3. Set the environment variables below (or hardcode for personal use)
+1. Telegram bot token + chat_id (already done)
+2. WorldTides API key (already done — remember the secret name must be
+   WORLDTIDES_KEY exactly, matching the workflow file)
+3. Env vars: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, WORLDTIDES_KEY
 """
 
 import os
@@ -27,36 +22,41 @@ from datetime import datetime, timedelta
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+WORLDTIDES_KEY = os.environ.get("WORLDTIDES_KEY", "")
 
-# Location: Lancieux uses Saint-Malo as reference tide station
 LAT, LON = 48.6167, -2.1333  # Lancieux approx coords
-SHOM_STATION = "SAINT-MALO"  # reference port for tide predictions
 
-# Condition thresholds — tune these to taste
-TIDE_WINDOW_HOURS = 1.5       # +/- hours around high tide considered "good"
+# Thresholds used only for the soft "good window" suggestion — no longer
+# used to decide whether to send a message at all.
+TIDE_WINDOW_HOURS = 1.5
 MAX_WIND_KMH = 20
 MAX_WAVE_HEIGHT_M = 0.6
-MIN_TEMP_C = 14                # air temp, adjust for your comfort
-DAYLIGHT_ONLY = True
+MIN_TEMP_C = 14
+
+# Open-Meteo weather codes -> plain text
+WEATHER_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Thunderstorm with heavy hail",
+}
+
 
 # ---- TIDE DATA ---------------------------------------------------------
 
 def fetch_tides(date_str):
-    """
-    Fetch high/low tide times for the reference station.
-    Placeholder using worldtides.info — swap for SHOM once you have API access.
-    Returns list of dicts: [{"type": "High", "time": datetime, "height": float}, ...]
-    """
-    # Example using worldtides.info (requires free API key)
-    api_key = os.environ.get("WORLDTIDES_KEY", "")
+    """Fetch high/low tide times for the area via worldtides.info."""
     url = "https://www.worldtides.info/api/v3"
     params = {
         "extremes": "",
         "lat": LAT,
         "lon": LON,
         "date": date_str,
-        "days": 1,
-        "key": api_key,
+        "days": 2,  # grab 2 days so late-day reports can show the next morning's tide too
+        "key": WORLDTIDES_KEY,
     }
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
@@ -69,21 +69,18 @@ def fetch_tides(date_str):
             "time": datetime.fromtimestamp(extreme["dt"]),
             "height": extreme["height"],
         })
-    return tides
+    return sorted(tides, key=lambda t: t["time"])
 
 
 # ---- WEATHER / MARINE DATA ---------------------------------------------
 
 def fetch_marine_weather():
-    """
-    Fetch wind, wave height, and air temp forecast from Open-Meteo (free, no key).
-    Returns hourly forecast dict keyed by ISO timestamp.
-    """
+    """Fetch wind, wave height, weather code, and air temp forecast (Open-Meteo, free, no key)."""
     weather_url = "https://api.open-meteo.com/v1/forecast"
     weather_params = {
         "latitude": LAT,
         "longitude": LON,
-        "hourly": "temperature_2m,windspeed_10m",
+        "hourly": "temperature_2m,windspeed_10m,weathercode",
         "timezone": "Europe/Paris",
         "forecast_days": 2,
     }
@@ -104,6 +101,7 @@ def fetch_marine_weather():
         forecast[t] = {
             "temp_c": w["hourly"]["temperature_2m"][i],
             "wind_kmh": w["hourly"]["windspeed_10m"][i],
+            "weather_code": w["hourly"]["weathercode"][i],
         }
     for i, t in enumerate(m["hourly"]["time"]):
         if t in forecast:
@@ -113,32 +111,32 @@ def fetch_marine_weather():
 
 
 def nearest_hour_forecast(forecast, target_time):
-    """Find the forecast entry closest to target_time."""
     target_str = target_time.strftime("%Y-%m-%dT%H:00")
     return forecast.get(target_str)
 
 
-# ---- CONDITIONS LOGIC ---------------------------------------------------
+def weather_text(code):
+    return WEATHER_CODES.get(code, f"Code {code}")
 
-def evaluate_window(high_tide_time, forecast):
-    """Check conditions in the window around a high tide."""
+
+# ---- SOFT GOOD-WINDOW SUGGESTION -----------------------------------------
+
+def good_window_note(high_tide_time, forecast):
+    """Returns a suggestion string near a high tide, or None if no data."""
     hour = nearest_hour_forecast(forecast, high_tide_time)
     if not hour:
         return None
 
-    reasons_bad = []
-    if hour["wind_kmh"] > MAX_WIND_KMH:
-        reasons_bad.append(f"wind {hour['wind_kmh']:.0f} km/h")
-    if hour.get("wave_m", 0) > MAX_WAVE_HEIGHT_M:
-        reasons_bad.append(f"waves {hour['wave_m']:.1f}m")
-    if hour["temp_c"] < MIN_TEMP_C:
-        reasons_bad.append(f"air temp {hour['temp_c']:.0f}°C")
-
-    return {
-        "good": len(reasons_bad) == 0,
-        "reasons_bad": reasons_bad,
-        "details": hour,
-    }
+    calm = (
+        hour["wind_kmh"] <= MAX_WIND_KMH
+        and hour.get("wave_m", 0) <= MAX_WAVE_HEIGHT_M
+        and hour["temp_c"] >= MIN_TEMP_C
+    )
+    if calm:
+        start = high_tide_time - timedelta(hours=TIDE_WINDOW_HOURS)
+        end = high_tide_time + timedelta(hours=TIDE_WINDOW_HOURS)
+        return f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+    return None
 
 
 # ---- TELEGRAM NOTIFY -----------------------------------------------------
@@ -152,37 +150,63 @@ def send_telegram(message):
     resp.raise_for_status()
 
 
+# ---- REPORT BUILDING -------------------------------------------------------
+
+def build_report(label, tides, forecast, reference_time):
+    """
+    Build a report covering the tides closest to reference_time (usually 'now'):
+    the nearest high and nearest low, plus the next high after that.
+    """
+    upcoming = [t for t in tides if t["time"] >= reference_time - timedelta(hours=2)]
+    if not upcoming:
+        return f"🌊 Lancieux/Saint-Malo — {label}\n\nNo tide data available."
+
+    # Take the next 3 tide events from now
+    next_tides = upcoming[:3]
+
+    lines = [f"🌊 Lancieux/Saint-Malo — {label}\n"]
+    for t in next_tides:
+        lines.append(f"{t['type']} tide: {t['time'].strftime('%H:%M')} ({t['height']:.1f}m)")
+
+    # Weather snapshot at the nearest upcoming tide
+    mid_point = next_tides[0]["time"]
+    hour = nearest_hour_forecast(forecast, mid_point)
+    if hour:
+        lines.append("")
+        lines.append(f"Conditions around {mid_point.strftime('%H:%M')}:")
+        lines.append(
+            f"🌡️ {hour['temp_c']:.0f}°C · 💨 Wind {hour['wind_kmh']:.0f} km/h · "
+            f"🌊 Waves {hour.get('wave_m', 0):.1f}m · {weather_text(hour['weather_code'])}"
+        )
+
+    # Soft suggestions for high tides in this report
+    notes = []
+    for t in next_tides:
+        if t["type"] == "High":
+            window = good_window_note(t["time"], forecast)
+            if window:
+                notes.append(window)
+    if notes:
+        lines.append("")
+        lines.append(f"Good swim windows (near high tide, calm-ish): {', '.join(notes)}")
+
+    return "\n".join(lines)
+
+
 # ---- MAIN -----------------------------------------------------------------
 
 def main():
-    send_telegram('Test message from GitHub Actions')
-    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+
     tides = fetch_tides(today)
     forecast = fetch_marine_weather()
 
-    highs = [t for t in tides if t["type"] == "High"]
-    if not highs:
-        send_telegram("Couldn't find tide data for today — check the script.")
-        return
+    label = "Morning report" if now.hour < 12 else "Afternoon report"
+    report = build_report(label, tides, forecast, now)
 
-    good_windows = []
-    for high in highs:
-        result = evaluate_window(high["time"], forecast)
-        if result and result["good"]:
-            good_windows.append(high)
-
-    if good_windows:
-        lines = ["🌊 Good swim conditions today (Lancieux/Saint-Malo):"]
-        for w in good_windows:
-            start = w["time"] - timedelta(hours=TIDE_WINDOW_HOURS)
-            end = w["time"] + timedelta(hours=TIDE_WINDOW_HOURS)
-            lines.append(f"High tide {w['time'].strftime('%H:%M')} "
-                         f"({w['height']:.1f}m) — good window {start.strftime('%H:%M')}–{end.strftime('%H:%M')}")
-        send_telegram("\n".join(lines))
-    else:
-        print("No good windows today — no notification sent.")
-        # Uncomment to always get a status message, even on bad days:
-        # send_telegram("No good swim windows today (wind/waves/temp not ideal).")
+    send_telegram(report)
+    print(report)
 
 
 if __name__ == "__main__":
