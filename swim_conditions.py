@@ -155,6 +155,7 @@ def send_telegram(message):
 # ---- MAIN -----------------------------------------------------------------
 
 def main():
+    send_telegram('Test message from GitHub Actions')
     today = datetime.now().strftime("%Y-%m-%d")
     tides = fetch_tides(today)
     forecast = fetch_marine_weather()
